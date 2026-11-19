@@ -51,6 +51,7 @@ def init_db():
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 full_name TEXT NOT NULL,
                 student_id TEXT NOT NULL UNIQUE,
+                phone TEXT NOT NULL DEFAULT '',
                 fingerprint_id INTEGER UNIQUE,
                 active INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
                 created_at TEXT NOT NULL
@@ -97,6 +98,9 @@ def init_db():
                 special_until TEXT
             );
         """)
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
+        if "phone" not in columns:
+            db.execute("ALTER TABLE users ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
         now = utc_now()
         db.execute("INSERT OR IGNORE INTO cabinet_control (id,mode,special_until,changed_at) VALUES (1,'auto',NULL,?)", (now,))
         room_names = {1: "ห้อง 213", 2: "ห้อง 214", 3: "ห้อง 215",
@@ -283,9 +287,9 @@ def web_admin(fn):
 def web_data():
     with connect_db() as db:
         control = control_state(db)
-        users = db.execute("SELECT id,full_name,student_id,fingerprint_id,active FROM users ORDER BY id DESC").fetchall()
+        users = db.execute("SELECT id,full_name,student_id,phone,fingerprint_id,active FROM users ORDER BY id DESC").fetchall()
         keys = db.execute("SELECT k.key_id,k.key_name,k.status,u.full_name borrower_name FROM keys k LEFT JOIN users u ON u.id=k.borrower_id ORDER BY k.key_id").fetchall()
-        logs = db.execute("SELECT t.id,t.key_id,k.key_name,u.full_name,t.action,t.created_at FROM transactions t LEFT JOIN keys k ON k.key_id=t.key_id LEFT JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 200").fetchall()
+        logs = db.execute("SELECT t.id,t.key_id,k.key_name,u.full_name,t.action,t.created_at, CASE WHEN t.fingerprint_id=0 THEN 'web-admin' ELSE 'esp32' END source FROM transactions t LEFT JOIN keys k ON k.key_id=t.key_id LEFT JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 200").fetchall()
         audit = db.execute("SELECT mode,actor,changed_at FROM control_audit ORDER BY id DESC LIMIT 30").fetchall()
     return jsonify(control=control, users=[dict(x) for x in users],keys=[dict(x) for x in keys],logs=[dict(x) for x in logs],audit=[dict(x) for x in audit])
 
@@ -295,11 +299,14 @@ def web_add_user():
     data=request.get_json(silent=True) or {}
     name=str(data.get("full_name", "")).strip()
     student=str(data.get("student_id", "")).strip()
+    phone=str(data.get("phone", "")).strip()
+    if not (len(phone)==10 and phone.isascii() and phone.isdigit()):
+        return jsonify(error="เบอร์โทรศัพท์ไม่ถูกต้อง"),400
     if not name or len(name)>150 or not student or len(student)>50:
         return jsonify(error="กรอกชื่อและรหัสนักศึกษาให้ถูกต้อง"),400
     try:
         with connect_db() as db:
-            db.execute("INSERT INTO users(full_name,student_id,created_at) VALUES(?,?,?)",(name,student,utc_now()))
+            db.execute("INSERT INTO users(full_name,student_id,phone,created_at) VALUES(?,?,?,?)",(name,student,phone,utc_now()))
     except sqlite3.IntegrityError:
         return jsonify(error="รหัสนักศึกษาซ้ำ"),409
     return jsonify(ok=True),201
@@ -332,6 +339,54 @@ def web_control():
     return jsonify(control=state)
 
 
+
+
+@app.post("/web/transactions")
+@web_admin
+def web_transaction():
+    """Admin-confirmed web checkout/checkin; never claims fingerprint authentication."""
+    data = request.get_json(silent=True) or {}
+    action = data.get("action")
+    key_id = positive_int(data, "key_id")
+    user_id = positive_int(data, "user_id")
+    if action not in ("borrow", "return") or key_id is None or key_id > KEY_COUNT or user_id is None:
+        return jsonify(error="กรุณาเลือกนักศึกษา ห้อง และรายการยืม/คืน"), 400
+    db = connect_db()
+    try:
+        db.execute("BEGIN IMMEDIATE")
+        control = control_state(db)
+        if not control["enabled"]:
+            db.rollback()
+            return jsonify(error="ตู้อยู่นอกเวลาใช้งาน หรือผู้ดูแลปิดระบบ"), 403
+        user = db.execute("SELECT * FROM users WHERE id=? AND active=1", (user_id,)).fetchone()
+        key = db.execute("SELECT * FROM keys WHERE key_id=?", (key_id,)).fetchone()
+        if user is None:
+            db.rollback()
+            return jsonify(error="ไม่พบผู้ใช้ที่เปิดใช้งาน"), 403
+        if key is None:
+            db.rollback()
+            return jsonify(error="ไม่พบช่องกุญแจ"), 404
+        if action == "borrow" and key["status"] != "available":
+            db.rollback()
+            return jsonify(error="กุญแจถูกยืมอยู่แล้ว"), 409
+        if action == "return" and (key["status"] != "borrowed" or key["borrower_id"] != user_id):
+            db.rollback()
+            return jsonify(error="ต้องเลือกนักศึกษาที่เป็นผู้ยืมกุญแจนี้"), 409
+        now = utc_now()
+        if action == "borrow":
+            db.execute("UPDATE keys SET status='borrowed',borrower_id=?,borrowed_at=?,updated_at=? WHERE key_id=?", (user_id,now,now,key_id))
+        else:
+            db.execute("UPDATE keys SET status='available',borrower_id=NULL,borrowed_at=NULL,updated_at=? WHERE key_id=?", (now,key_id))
+        # 0 is reserved for web/admin transactions; sensor template IDs are positive.
+        cur = db.execute("INSERT INTO transactions(key_id,user_id,fingerprint_id,action,created_at) VALUES (?,?,0,?,?)", (key_id,user_id,action,now))
+        db.commit()
+        return jsonify(success=True,transaction_id=cur.lastrowid,action=action,source="web-admin",physical_unlock=False),201
+    except sqlite3.Error:
+        db.rollback()
+        app.logger.exception("Web transaction failed")
+        return jsonify(error="บันทึกข้อมูลไม่สำเร็จ"),500
+    finally:
+        db.close()
 
 @app.get("/health")
 def health():
@@ -452,9 +507,6 @@ def borrow_key():
         if not control_state(db)["enabled"]:
             db.rollback()
             return jsonify(error="Cabinet is outside permitted hours or disabled by admin"), 403
-        if not control_state(db)["enabled"]:
-            db.rollback()
-            return jsonify(error="Cabinet is closed"), 403
         user = find_active_user(db, fp)
         if user is None:
             db.rollback()
@@ -510,9 +562,6 @@ def return_key():
         if not control_state(db)["enabled"]:
             db.rollback()
             return jsonify(error="Cabinet is outside permitted hours or disabled by admin"), 403
-        if not control_state(db)["enabled"]:
-            db.rollback()
-            return jsonify(error="Cabinet is closed"), 403
         user = find_active_user(db, fp)
         if user is None:
             db.rollback()
