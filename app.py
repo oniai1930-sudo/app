@@ -99,12 +99,19 @@ def init_db():
         """)
         now = utc_now()
         db.execute("INSERT OR IGNORE INTO cabinet_control (id,mode,special_until,changed_at) VALUES (1,'auto',NULL,?)", (now,))
+        room_names = {1: "ห้อง 213", 2: "ห้อง 214", 3: "ห้อง 215",
+                      4: "ห้อง 216", 5: "ห้อง 222", 6: "ห้อง 223"}
         for key_id in range(1, KEY_COUNT + 1):
             db.execute(
                 """INSERT OR IGNORE INTO keys
                    (key_id, key_name, status, updated_at)
                    VALUES (?, ?, 'available', ?)""",
-                (key_id, f"กุญแจช่อง {key_id}", now),
+                (key_id, room_names[key_id], now),
+            )
+            # Rename only the original default names; preserve custom names and all history.
+            db.execute(
+                "UPDATE keys SET key_name=?, updated_at=? WHERE key_id=? AND key_name=?",
+                (room_names[key_id], now, key_id, f"กุญแจช่อง {key_id}"),
             )
 
 
@@ -235,7 +242,12 @@ def public_status_data():
     with connect_db() as db:
         state = control_state(db)
         rows = db.execute("SELECT key_id,key_name,status FROM keys ORDER BY key_id").fetchall()
-    return jsonify(control={k:state[k] for k in ("label", "service_hours")}, keys=[dict(r) for r in rows])
+        history_rows = db.execute("""SELECT t.created_at, k.key_name, t.action
+            FROM transactions t JOIN keys k ON k.key_id=t.key_id
+            ORDER BY t.id DESC LIMIT 50""").fetchall()
+    return jsonify(control={k:state[k] for k in ("label", "service_hours")},
+                   keys=[dict(r) for r in rows],
+                   history=[dict(r) for r in history_rows])
 
 @app.post("/web/login")
 def web_login():
