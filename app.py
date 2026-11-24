@@ -97,6 +97,19 @@ def init_db():
                 changed_at TEXT NOT NULL,
                 special_until TEXT
             );
+            CREATE TABLE IF NOT EXISTS enrollment_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                status TEXT NOT NULL CHECK(status IN ('pending','in_progress','success','failed','cancelled')),
+                fingerprint_id INTEGER UNIQUE,
+                message TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_enrollment_jobs_status
+                ON enrollment_jobs(status, id);
+            CREATE INDEX IF NOT EXISTS idx_enrollment_jobs_user
+                ON enrollment_jobs(user_id, id DESC);
         """)
         columns = {row["name"] for row in db.execute("PRAGMA table_info(users)")}
         if "phone" not in columns:
@@ -291,7 +304,10 @@ def web_data():
         keys = db.execute("SELECT k.key_id,k.key_name,k.status,u.full_name borrower_name FROM keys k LEFT JOIN users u ON u.id=k.borrower_id ORDER BY k.key_id").fetchall()
         logs = db.execute("SELECT t.id,t.key_id,k.key_name,u.full_name,t.action,t.created_at, CASE WHEN t.fingerprint_id=0 THEN 'web-admin' ELSE 'esp32' END source FROM transactions t LEFT JOIN keys k ON k.key_id=t.key_id LEFT JOIN users u ON u.id=t.user_id ORDER BY t.id DESC LIMIT 200").fetchall()
         audit = db.execute("SELECT mode,actor,changed_at FROM control_audit ORDER BY id DESC LIMIT 30").fetchall()
-    return jsonify(control=control, users=[dict(x) for x in users],keys=[dict(x) for x in keys],logs=[dict(x) for x in logs],audit=[dict(x) for x in audit])
+        jobs = db.execute("""SELECT j.id,j.user_id,j.status,j.fingerprint_id,j.message,j.created_at,j.updated_at
+            FROM enrollment_jobs j JOIN (SELECT user_id,MAX(id) id FROM enrollment_jobs GROUP BY user_id) latest
+            ON latest.id=j.id""").fetchall()
+    return jsonify(control=control, users=[dict(x) for x in users],keys=[dict(x) for x in keys],logs=[dict(x) for x in logs],audit=[dict(x) for x in audit],enrollments=[dict(x) for x in jobs])
 
 @app.post("/web/users")
 @web_admin
@@ -321,6 +337,109 @@ def web_update_user(user_id):
         cur=db.execute("UPDATE users SET active=? WHERE id=?",(int(data["active"]),user_id))
         if not cur.rowcount:return jsonify(error="ไม่พบผู้ใช้"),404
     return jsonify(ok=True)
+
+@app.post("/web/enrollments")
+@web_admin
+def web_create_enrollment():
+    data = request.get_json(silent=True) or {}
+    user_id = positive_int(data, "user_id")
+    if user_id is None:
+        return jsonify(error="user_id ไม่ถูกต้อง"), 400
+    now = utc_now()
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        user = db.execute("SELECT id,full_name,student_id,fingerprint_id,active FROM users WHERE id=?", (user_id,)).fetchone()
+        if user is None or not user["active"]:
+            return jsonify(error="ไม่พบผู้ใช้หรือบัญชีถูกปิดใช้งาน"), 404
+        if user["fingerprint_id"] is not None:
+            return jsonify(error="นักศึกษาคนนี้มีลายนิ้วมือแล้ว"), 409
+        active_job = db.execute("SELECT id FROM enrollment_jobs WHERE status IN ('pending','in_progress') LIMIT 1").fetchone()
+        if active_job:
+            return jsonify(error=f"มีงานลงทะเบียนหมายเลข {active_job['id']} กำลังดำเนินการ กรุณารอให้เสร็จก่อน"), 409
+        cur = db.execute("INSERT INTO enrollment_jobs(user_id,status,message,created_at,updated_at) VALUES(?,'pending','รอ ESP32 รับคำสั่ง',?,?)", (user_id,now,now))
+        job_id = cur.lastrowid
+    return jsonify(ok=True, job_id=job_id, status="pending"), 201
+
+
+@app.get("/web/enrollments/<int:job_id>")
+@web_admin
+def web_enrollment_status(job_id):
+    with connect_db() as db:
+        row = db.execute("SELECT id,user_id,status,fingerprint_id,message,created_at,updated_at FROM enrollment_jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None:
+        return jsonify(error="ไม่พบงานลงทะเบียน"), 404
+    return jsonify(job=dict(row))
+
+
+@app.post("/web/enrollments/<int:job_id>/cancel")
+@web_admin
+def web_cancel_enrollment(job_id):
+    now = utc_now()
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        row = db.execute("SELECT status FROM enrollment_jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            return jsonify(error="ไม่พบงานลงทะเบียน"), 404
+        if row["status"] != "pending":
+            return jsonify(error="ยกเลิกได้เฉพาะงานที่ยังรอ ESP32 รับคำสั่ง"), 409
+        db.execute("UPDATE enrollment_jobs SET status='cancelled',message='ยกเลิกโดย Admin',updated_at=? WHERE id=?", (now,job_id))
+    return jsonify(ok=True,status="cancelled")
+
+
+@app.get("/api/device/enrollments/next")
+@device
+def device_next_enrollment():
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        # Only one physical enrollment may run at a time.
+        running = db.execute("SELECT id FROM enrollment_jobs WHERE status='in_progress' LIMIT 1").fetchone()
+        if running:
+            return jsonify(busy=True, job_id=running["id"]), 200
+        row = db.execute("""SELECT j.id,j.user_id,u.full_name,u.student_id
+            FROM enrollment_jobs j JOIN users u ON u.id=j.user_id
+            WHERE j.status='pending' AND u.active=1 ORDER BY j.id LIMIT 1""").fetchone()
+        if row is None:
+            return ("", 204)
+        now = utc_now()
+        db.execute("UPDATE enrollment_jobs SET status='in_progress',message='ESP32 รับงานแล้ว กรุณาสแกนนิ้ว',updated_at=? WHERE id=? AND status='pending'", (now,row["id"]))
+        used = [r[0] for r in db.execute("SELECT fingerprint_id FROM users WHERE fingerprint_id IS NOT NULL").fetchall()]
+    return jsonify(job_id=row["id"],user_id=row["user_id"],full_name=row["full_name"],student_id=row["student_id"],used_fingerprint_ids=used), 200
+
+
+@app.post("/api/device/enrollments/<int:job_id>/result")
+@device
+def device_enrollment_result(job_id):
+    data = request.get_json(silent=True) or {}
+    success = data.get("success")
+    if type(success) is not bool:
+        return jsonify(error="success ต้องเป็น true หรือ false"), 400
+    fp_id = data.get("fingerprint_id")
+    message = str(data.get("message", ""))[:250]
+    now = utc_now()
+    with connect_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        job = db.execute("SELECT * FROM enrollment_jobs WHERE id=?", (job_id,)).fetchone()
+        if job is None:
+            return jsonify(error="ไม่พบงานลงทะเบียน"), 404
+        if job["status"] == "success":
+            return jsonify(ok=True,status="success",fingerprint_id=job["fingerprint_id"],idempotent=True), 200
+        if job["status"] != "in_progress":
+            return jsonify(error="งานนี้ไม่ได้อยู่ในสถานะกำลังลงทะเบียน"), 409
+        if success:
+            if type(fp_id) is not int or not 1 <= fp_id <= 127:
+                return jsonify(error="fingerprint_id ต้องอยู่ระหว่าง 1 ถึง 127"), 400
+            user = db.execute("SELECT fingerprint_id,active FROM users WHERE id=?", (job["user_id"],)).fetchone()
+            if user is None or not user["active"] or user["fingerprint_id"] is not None:
+                return jsonify(error="บัญชีไม่พร้อมผูกหมายเลขลายนิ้วมือ"), 409
+            duplicate = db.execute("SELECT id FROM users WHERE fingerprint_id=?", (fp_id,)).fetchone()
+            if duplicate:
+                return jsonify(error="หมายเลข Fingerprint ID นี้ถูกใช้งานแล้ว"), 409
+            db.execute("UPDATE users SET fingerprint_id=? WHERE id=?", (fp_id,job["user_id"]))
+            db.execute("UPDATE enrollment_jobs SET status='success',fingerprint_id=?,message=?,updated_at=? WHERE id=?", (fp_id,message or "ลงทะเบียนสำเร็จ",now,job_id))
+        else:
+            db.execute("UPDATE enrollment_jobs SET status='failed',message=?,updated_at=? WHERE id=?", (message or "เซนเซอร์รายงานว่าลงทะเบียนไม่สำเร็จ",now,job_id))
+    return jsonify(ok=True,status="success" if success else "failed",fingerprint_id=fp_id if success else None), 200
+
 
 @app.post("/web/control")
 @web_admin
