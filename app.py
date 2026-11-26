@@ -803,3 +803,10 @@ if __name__ == "__main__":
     if not all((ADMIN_API_KEY, DEVICE_API_KEY, ADMIN_PASSWORD, app.secret_key)):
         raise SystemExit("Set ADMIN_API_KEY, DEVICE_API_KEY, ADMIN_PASSWORD and SECRET_KEY")
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "5000")), debug=False)
+
+stale = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat(timespec="seconds")
+db.execute(
+    "UPDATE enrollment_jobs SET status='failed', message='หมดเวลา ESP32 ไม่ส่งผล', updated_at=? "
+    "WHERE status='in_progress' AND updated_at < ?",
+    (utc_now(), stale),
+)
